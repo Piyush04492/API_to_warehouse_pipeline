@@ -1,0 +1,297 @@
+# =============================================================
+# docker-compose.yml
+# =============================================================
+# This file defines ALL the services (containers) our project needs.
+# Run with: docker compose up -d
+#
+# SERVICES:
+#   mysql          : Our MySQL 8.0 database
+#   airflow-init   : One-time setup container (creates Airflow DB + admin user)
+#   airflow-webserver : The Airflow web UI (http://localhost:8080)
+#   airflow-scheduler : The process that actually triggers and runs DAG tasks
+#   airflow-triggerer : Handles deferrable operators (async tasks)
+#
+# HOW SERVICES COMMUNICATE:
+#   All services are on the same Docker network ("weather_net").
+#   They reference each other by SERVICE NAME (not "localhost").
+#   e.g., the Airflow scheduler connects to MySQL using host "mysql".
+# =============================================================
+
+version: "3.8"
+
+# =============================================================
+# NAMED VOLUMES
+# =============================================================
+# Volumes persist data even when containers are stopped/deleted.
+volumes:
+  # Stores MySQL data files — your weather data survives container restarts
+  mysql_data:
+
+  # Stores Airflow's internal metadata (DAG runs, task logs, etc.)
+  postgres_data:
+
+
+# =============================================================
+# SHARED ENVIRONMENT for all Airflow services
+# =============================================================
+# Using YAML anchors (&airflow-common-env) so we don't repeat
+# the same environment variables in every Airflow service.
+
+x-airflow-common-env: &airflow-common-env
+  # Airflow's metadata database (where it stores DAG run history)
+  # This is a SEPARATE database from our weather MySQL database
+  AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres/airflow
+
+  # Executor: LocalExecutor runs tasks as subprocesses (simple, good for dev)
+  AIRFLOW__CORE__EXECUTOR: LocalExecutor
+
+  # Load example DAGs: False (we don't want Airflow's built-in demo DAGs)
+  AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+
+  # Secret key for Airflow's web UI sessions (change in production!)
+  AIRFLOW__WEBSERVER__SECRET_KEY: "weather_pipeline_secret_key_change_me"
+
+  # Our weather MySQL database credentials (used by our src/ code)
+  # These are read in dag/weather_pipeline_dag.py via os.environ.get()
+  WEATHER_DB_HOST: mysql
+  WEATHER_DB_PORT: "3306"
+  WEATHER_DB_NAME: weather_db
+  WEATHER_DB_USER: weather_user
+  WEATHER_DB_PASSWORD: weather_pass
+
+
+# =============================================================
+# SERVICES
+# =============================================================
+services:
+
+  # -----------------------------------------------------------
+  # 1. MySQL — Our weather data warehouse
+  # -----------------------------------------------------------
+  mysql:
+    image: mysql:8.0
+    container_name: weather_mysql
+
+    environment:
+      # Root password (admin access)
+      MYSQL_ROOT_PASSWORD: rootpassword
+
+      # Creates a database named "weather_db" on first startup
+      MYSQL_DATABASE: weather_db
+
+      # Creates a user with access to weather_db
+      MYSQL_USER: weather_user
+      MYSQL_PASSWORD: weather_pass
+
+    ports:
+      # Map host port 3307 → container port 3306
+      # We use 3307 on the host to avoid conflicts if you have
+      # a local MySQL already running on 3306
+      - "3307:3306"
+
+    volumes:
+      # Persist MySQL data between container restarts
+      - mysql_data:/var/lib/mysql
+
+      # Automatically run create_tables.sql when the container starts for the first time
+      # MySQL runs all .sql files in /docker-entrypoint-initdb.d/ on first boot
+      - ./sql:/docker-entrypoint-initdb.d
+
+    networks:
+      - weather_net
+
+    # Health check: wait until MySQL accepts connections before starting Airflow
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost",
+             "-u", "weather_user", "-pweather_pass"]
+      interval: 10s   # Check every 10 seconds
+      timeout: 5s     # Give up if no response in 5 seconds
+      retries: 10     # Try 10 times before marking as unhealthy
+      start_period: 30s  # Give MySQL 30 seconds to start before checking
+
+  # -----------------------------------------------------------
+  # 2. PostgreSQL — Airflow's internal metadata database
+  # -----------------------------------------------------------
+  # Airflow needs its OWN database to store DAG run history,
+  # task states, XCom values, etc. We use PostgreSQL for this.
+  # This is NOT where our weather data is stored!
+  postgres:
+    image: postgres:15
+    container_name: airflow_postgres
+
+    environment:
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: airflow
+      POSTGRES_DB: airflow
+
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+
+    networks:
+      - weather_net
+
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "airflow"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # -----------------------------------------------------------
+  # 3. Airflow Init — One-time database setup
+  # -----------------------------------------------------------
+  # This container runs ONCE and exits:
+  #   1. Initializes the Airflow metadata database (creates tables)
+  #   2. Creates the admin user (admin/admin)
+  # After it finishes, the webserver and scheduler can start.
+  airflow-init:
+    image: apache/airflow:2.8.1
+    container_name: airflow_init
+
+    environment:
+      <<: *airflow-common-env  # Inherit shared env vars
+
+    # depends_on ensures PostgreSQL is healthy before we try to init Airflow
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+    volumes:
+      # Mount our project files into the Airflow container
+      - ./dags:/opt/airflow/dags        # Airflow reads DAGs from here
+      - ./src:/opt/airflow/src          # Our ETL source code
+      - ./logs:/opt/airflow/logs        # Pipeline log files
+      - ./sql:/opt/airflow/sql          # SQL files (for reference)
+
+    # Install our Python dependencies, then initialize the DB and create admin user
+    command: >
+      bash -c "
+        pip install requests pandas sqlalchemy pymysql &&
+        airflow db init &&
+        airflow users create
+          --username admin
+          --password admin
+          --firstname Admin
+          --lastname User
+          --role Admin
+          --email admin@example.com
+      "
+
+    networks:
+      - weather_net
+
+  # -----------------------------------------------------------
+  # 4. Airflow Webserver — The web UI
+  # -----------------------------------------------------------
+  # Runs the web interface at http://localhost:8080
+  # Login: admin / admin (created by airflow-init above)
+  airflow-webserver:
+    image: apache/airflow:2.8.1
+    container_name: airflow_webserver
+
+    environment:
+      <<: *airflow-common-env
+
+    depends_on:
+      postgres:
+        condition: service_healthy
+      airflow-init:
+        condition: service_completed_successfully  # Wait for init to finish
+
+    ports:
+      - "8080:8080"  # Access the UI at http://localhost:8080
+
+    volumes:
+      - ./dags:/opt/airflow/dags
+      - ./src:/opt/airflow/src
+      - ./logs:/opt/airflow/logs
+
+    # Install dependencies, then start the webserver
+    command: >
+      bash -c "
+        pip install requests pandas sqlalchemy pymysql &&
+        airflow webserver
+      "
+
+    networks:
+      - weather_net
+
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+
+  # -----------------------------------------------------------
+  # 5. Airflow Scheduler — The brain of Airflow
+  # -----------------------------------------------------------
+  # Continuously monitors DAGs, decides when to trigger tasks,
+  # and assigns tasks to workers (executors) to actually run.
+  airflow-scheduler:
+    image: apache/airflow:2.8.1
+    container_name: airflow_scheduler
+
+    environment:
+      <<: *airflow-common-env
+
+    depends_on:
+      postgres:
+        condition: service_healthy
+      airflow-init:
+        condition: service_completed_successfully
+
+    volumes:
+      - ./dags:/opt/airflow/dags
+      - ./src:/opt/airflow/src
+      - ./logs:/opt/airflow/logs
+
+    # Install dependencies, then start the scheduler
+    command: >
+      bash -c "
+        pip install requests pandas sqlalchemy pymysql &&
+        airflow scheduler
+      "
+
+    networks:
+      - weather_net
+
+  # -----------------------------------------------------------
+  # 6. Airflow Triggerer — Handles async/deferrable tasks
+  # -----------------------------------------------------------
+  # Required for modern Airflow installations.
+  # Handles tasks that can "defer" and wait without blocking a worker.
+  airflow-triggerer:
+    image: apache/airflow:2.8.1
+    container_name: airflow_triggerer
+
+    environment:
+      <<: *airflow-common-env
+
+    depends_on:
+      postgres:
+        condition: service_healthy
+      airflow-init:
+        condition: service_completed_successfully
+
+    volumes:
+      - ./dags:/opt/airflow/dags
+      - ./src:/opt/airflow/src
+      - ./logs:/opt/airflow/logs
+
+    command: >
+      bash -c "
+        pip install requests pandas sqlalchemy pymysql &&
+        airflow triggerer
+      "
+
+    networks:
+      - weather_net
+
+
+# =============================================================
+# NETWORKS
+# =============================================================
+# All containers join this network, so they can talk to each other
+# using service names (e.g., "mysql", "postgres") instead of IPs.
+networks:
+  weather_net:
+    driver: bridge
